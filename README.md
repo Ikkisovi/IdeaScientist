@@ -396,15 +396,14 @@ run.
 
 ## Citation
 
-Be here soon!
-
-<!-- ```bibtex
-@article{ideascientist,
-  title     = {IdeaScientist: Orchestrating Agents for Grounded Scientific Ideation},
-  journal={arXiv preprint arXiv:},
+```bibtex
+@article{liu2026ideascientist,
+  title={IdeaScientist: Orchestrating Agents for Grounded Scientific Ideation},
+  author={Liu, Jiarui and Tao, Renjie and Liao, Yiwei and Jin, Chuanyang and Sun, Kai and Yang, Xiao and Zhang, Xinyuan and Chen, Xilun and Huang, Zhuangqun and Zhang, Lechen and others},
+  journal={arXiv preprint arXiv:2610.04074},
   year={2026}
 }
-``` -->
+```
 
 ## License
 
