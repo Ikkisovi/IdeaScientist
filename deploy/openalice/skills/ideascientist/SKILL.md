@@ -162,3 +162,20 @@ after the owner exits for those cases.
   4. Apply `references/openalice-ideascientist.patch` to the pinned clone.
   5. Create a venv with CPU torch and sentence-transformers.
   6. Write `env.sh` as in `references/REPRODUCTION.md`.
+
+## Atlas page
+
+The private Atlas page shows questions, runs, reviewed candidates and the vault papers they cite. It has a tree view and a graph view, and lives at https://claude.ai/artifact/13bkSq2R4uX5AiPp6qNpXq.
+
+To refresh its data:
+
+1. Rebuild the data file:
+
+   ```bash
+   cd $IDEASCIENTIST_HOME
+   PYTHONPATH=IdeaScientist-patched /home/ikkipipi/openalice/.venv/bin/python build_site_data.py <data.json>
+   ```
+
+   A copy of the script is also in `scripts/build_site_data.py`.
+
+2. Republish `data.json` next to the page with the Artifact tool, passing `url`. A shell script cannot republish the page itself.

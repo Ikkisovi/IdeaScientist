@@ -427,3 +427,17 @@ def get_stored_full_text(paper_id: int) -> str:
         from ideascientist.vault.fields import serialize_labeled
         return "\n\n".join(f"## {k.replace('_', ' ').title()}\n{serialize_labeled(v)}" for k, v in rec.items() if v)
     return ""
+
+# OpenAlice optional financial literature extension.
+if os.environ.get("IDEASCIENTIST_FINANCE_DB"):
+    import sys as _finance_sys
+    from .finance_overlay import install as _install_finance
+    _install_finance(_finance_sys.modules[__name__], os.environ["IDEASCIENTIST_FINANCE_DB"],
+                     os.environ.get("IDEASCIENTIST_FINANCE_SHA256", ""))
+
+# OpenAlice optional paper-code evidence extension.
+if os.environ.get("IDEASCIENTIST_CODE_DB"):
+    from .code_overlay import install as _install_code
+    _install_code(_finance_sys.modules[__name__] if "_finance_sys" in globals() else __import__("sys").modules[__name__],
+                  os.environ["IDEASCIENTIST_CODE_DB"], os.environ.get("IDEASCIENTIST_CODE_SHA256", ""),
+                  os.environ["IDEASCIENTIST_CODE_AVAILABILITY_DATE"])

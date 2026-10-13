@@ -1,0 +1,10 @@
+{
+  "manifest": "/mnt/samsung_ssd/openalice-data/lea91-qc-basis-rebuild-20261005-v1/publication/release/manifest.json",
+  "manifest_sha256": "872dbbf9fedd9a07ec885bc6c8e53ab22cdc47712ad31c0348a982b56ae6ccca",
+  "date_slice": [2100, 2612],
+  "entity_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "fields": ["r5__amihud_mean", "r5__chip_mean_position", "r5__chip_overlap", "r5__chl", "r5__price_volume_corr_mean_21d", "r5__vol_fft", "scan2_daily__scan2_p05_left_momentum_j20", "scan2_daily__scan2_p21_left_robust_momentum_k20"],
+  "cpus": [18, 19],
+  "memory_mib": 4096,
+  "wall_seconds": 600
+}
