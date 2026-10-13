@@ -71,7 +71,8 @@ async def _run(args: argparse.Namespace) -> None:
     logger.info("run directory: %s", run_dir)
 
 
-    kwargs = {"max_turns": args.max_turns, "max_sub_turns": args.max_sub_turns}
+    kwargs = {"max_turns": args.max_turns, "max_sub_turns": args.max_sub_turns,
+              "finalization_turns": args.finalization_turns}
     if args.model:
         kwargs["model"] = args.model
     if args.query_paper_id:
@@ -100,6 +101,8 @@ def main() -> None:
     p.add_argument("--run-dir", default="runs", help="base directory for run outputs")
     p.add_argument("--max-turns", type=int, default=100,
                    help="orchestrator turn cap (paper setting: 100)")
+    p.add_argument("--finalization-turns", type=int, default=20,
+                   help="reserve from orchestrator exploration; hard cap for final writer (default: 20)")
     p.add_argument("--max-sub-turns", type=int, default=40,
                    help="per-sub-agent tool-use turn cap; per-role caps in tools.py bind first")
     asyncio.run(_run(p.parse_args()))

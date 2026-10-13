@@ -1,0 +1,2 @@
+{"mode": "responses", "drop": ["chat_template_kwargs"], "session_header": "x-opencode-session",
+ "upstreams": [{"provider": "opencode-go", "base": "https://opencode.ai/zen/go/v1"}]}

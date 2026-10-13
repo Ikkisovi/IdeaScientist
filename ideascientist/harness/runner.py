@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from ideascientist.harness import tools as T
+from ideascientist.harness.completion import complete, proposal, verdicts
 from ideascientist.harness.client import AgenticLLMClient
 from ideascientist.harness.orchestrator import orchestrator_prompt
 from ideascientist.harness.runlog import RunLogger, SharedLogRegistry
@@ -351,7 +352,7 @@ def build_reader_task(paper_id, goals: list, prior_digest: str = "") -> str:
     from ideascientist.harness import corpus as C
     from ideascientist.harness.tools import FULLTEXT_CHAR_LIMIT
 
-    _tok_cap = READER_INPUT_TOKEN_CAP
+    _tok_cap = READER_INPUT_TOKEN_CAP  # openalice patch: was undefined (NameError swallowed -> empty full text)
     pid = int(paper_id)
     goal_lines = "\n".join(f"- {g}" for g in goals) or \
         "- summarize the paper's method, key results, and stated limitations"
@@ -359,7 +360,7 @@ def build_reader_task(paper_id, goals: list, prior_digest: str = "") -> str:
     # Pre-fetch body + biblio (cheap local DB reads; the LLM cost is the prefill,
     # which prefix-caching now shares across generations).
     try:
-        raw_fulltext = C.get_stored_full_text(paper_id=pid) or ""
+        raw_fulltext = C.get_stored_full_text(paper_id=pid) or ""  # openalice patch: no `key` parameter (TypeError swallowed)
         # Head-and-tail truncation: the intro, method, conclusion and limitations
         # are where a gap claim is grounded, and plain end-truncation would cut the
         # limitations first. 0 disables and falls back to the character cap.
@@ -515,7 +516,7 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
                   max_sub_turns: int | None = None,
                   *, base_url: str | None = None,
                   text_tools: bool | None = None, api_key: str | None = None,
-                  solo_first_turn: bool | None = None):
+                  solo_first_turn: bool | None = None, hard_turn_cap: int | None = None):
     """Run one subagent to completion in its own client, so many can run
     concurrently without shared-state races.
 
@@ -541,6 +542,8 @@ def _run_subagent(role, task, ctx, model, log, log_key, conversation_id,
     _turn_override = _role_env_int_map("IDEASCIENTIST_ROLE_TURN_CAP").get(role)
     if _turn_override is not None and _turn_override > 0:
         max_sub_turns = _turn_override
+    if hard_turn_cap is not None:
+        max_sub_turns = min(max_sub_turns, hard_turn_cap)
     # Per-role endpoint and model routing: unless the caller pinned base_url/model,
     # IDEASCIENTIST_ROLE_BASE_URL / IDEASCIENTIST_ROLE_MODEL send this role to its
     # own pool and checkpoint. A role absent from the map falls through to the
@@ -638,8 +641,11 @@ async def run_ideation(
     query_paper_id: Optional[int] = None,
     max_turns: int = 100,
     max_sub_turns: int = 40,
+    finalization_turns: int = 20,
 ) -> dict:
     model = model or os.environ.get("IDEASCIENTIST_MODEL") or DEFAULT_MODEL
+    if max_turns < 1 or finalization_turns < 1:
+        raise ValueError("turn budgets must be positive")
     run_dir = Path(run_dir).resolve()
     docs_dir = run_dir / "outputs"   # agent-written working docs
     logs_dir = run_dir / "logs"      # debug logs (harness_log/llm_calls/summary/_sublogs)
@@ -670,7 +676,7 @@ async def run_ideation(
     # short-circuiting on cache, so it can reuse already-answered goals and append
     # only the new ones.
     reader_acc = {"tokens": 0, "calls": 0, "n": 0, "parser_retries": 0}
-    _reader_lock = threading.Lock()
+    _reader_lock = threading.Lock()  # openalice patch: was undefined (NameError on every read_paper)
 
     def _read_paper(paper_id: int, goals: list) -> str:
         digest_path = docs_dir / "papers" / f"{paper_id}.md"
@@ -734,87 +740,123 @@ async def run_ideation(
     orch_nudges = 0          # premature-stop nudges (see no-tool-call guard below)
     MAX_ORCH_NUDGES = 8
     window = context_window_for(model)
-    for turn in range(max_turns):
-        # Context-budget heartbeat: LOG only, never into the model-visible context
-        # (train/deploy parity — no [budget] line). Shows the orchestrator's OWN usage.
-        _log_heartbeat(log, client.last_prompt_tokens, window)
-        client.set_step(f"orch:{turn}")
-        msg = client.chat(messages, tools=orch_tools)["choices"][0]["message"]
-        messages.append(msg)
-        tcs = msg.get("tool_calls") or []
-        if not tcs:
-            # Premature-stop guard: some models (notably gpt-oss via /responses) emit
-            # analysis-only with NO tool call before the report exists, which would end
-            # the run with no report.json. If the final artifact isn't produced yet and
-            # nudges remain, inject a continue-nudge and keep going instead of ending.
-            if not (docs_dir / "report.json").exists() and orch_nudges < MAX_ORCH_NUDGES:
-                orch_nudges += 1
-                log.event("orch_nudge", turn=turn, n=orch_nudges, reason="no_tool_calls_before_report")
-                messages.append({"role": "user", "content": (
-                    "You have NOT yet produced the final report (report.json), so the task is "
-                    "not complete. Do not stop or reply with analysis only. Continue the workflow "
-                    "by issuing a tool call now — e.g. spawn_subagent(role='report_writer', task=...) "
-                    "once candidate ideas exist, or spawn the next needed subagent / edit_doc. "
-                    "Respond with a tool call, not prose.")})
-                continue
-            log.event("loop_end", turn=turn, reason="no_tool_calls")
-            break
-
-        results: dict[str, str] = {}
-        spawns = []  # (tool_call_id, coroutine)
-        for tc in tcs:
-            n_tool_calls += 1
-            fn = tc["function"]["name"]
-            fargs, perr = _parse_tool_args(tc)
-            if perr:
-                results[tc["id"]] = perr[0]
-                log.event("tool_error", tool=fn, error="bad_json_args", raw_args=perr[1])
-                continue
-            if fn == "spawn_subagent":
-                _srole = fargs.get("role", "")
-                # A PIPELINE ABLATION removes whole stages from the action space. The
-                # spawn_subagent enum is already narrowed via T.available_roles(), so
-                # this only catches a model that ignores the schema — refuse rather
-                # than silently run a role the arm is supposed to have removed.
-                if _srole not in roles:
-                    results[tc["id"]] = (
-                        f"ERROR: role {_srole!r} is not available in this run. "
-                        f"Available roles: {', '.join(roles)}."
-                    )
-                    log.event("tool_error", tool="spawn_subagent",
-                              error=f"role_not_available:{_srole}")
+    exploration_turns = max(1, max_turns - finalization_turns)
+    stop_reason = "orchestrator_stopped"
+    loop_error = ""
+    finalizer_error = ""
+    try:
+        for turn in range(exploration_turns):
+            # Context-budget heartbeat: LOG only, never into the model-visible context
+            # (train/deploy parity — no [budget] line). Shows the orchestrator's OWN usage.
+            _log_heartbeat(log, client.last_prompt_tokens, window)
+            client.set_step(f"orch:{turn}")
+            msg = client.chat(messages, tools=orch_tools)["choices"][0]["message"]
+            messages.append(msg)
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                # Premature-stop guard: some models (notably gpt-oss via /responses) emit
+                # analysis-only with NO tool call before the report exists, which would end
+                # the run with no report.json. If the final artifact isn't produced yet and
+                # nudges remain, inject a continue-nudge and keep going instead of ending.
+                if proposal(docs_dir) is None and orch_nudges < MAX_ORCH_NUDGES:
+                    orch_nudges += 1
+                    log.event("orch_nudge", turn=turn, n=orch_nudges, reason="no_tool_calls_before_report")
+                    messages.append({"role": "user", "content": (
+                        "You have NOT yet produced the final report (report.json), so the task is "
+                        "not complete. Do not stop or reply with analysis only. Continue the workflow "
+                        "by issuing a tool call now — e.g. spawn_subagent(role='report_writer', task=...) "
+                        "once candidate ideas exist, or spawn the next needed subagent / edit_doc. "
+                        "Respond with a tool call, not prose.")})
                     continue
-                n_subagents += 1
-                log.event("spawn_subagent", role=_srole)
-                spawns.append((tc["id"], asyncio.to_thread(
-                    _run_subagent, _srole, fargs.get("task", ""),
-                    ctx, model, log, _srole, f"{_srole}#{n_subagents}",
-                    max_sub_turns)))
-            else:
-                try:
-                    results[tc["id"]] = T.run_tool(fn, fargs, ctx, tool_call_id=tc["id"])
-                except Exception as exc:  # noqa: BLE001
-                    results[tc["id"]] = f"ERROR in {fn}: {exc}"
-                    log.event("tool_error", tool=fn, error=str(exc), tool_call_id=tc["id"])
+                log.event("loop_end", turn=turn, reason="no_tool_calls")
+                break
 
-        if spawns:  # run all subagents of this turn concurrently
-            done = await asyncio.gather(*[c for _, c in spawns], return_exceptions=True)
-            for (tid, _), r in zip(spawns, done):
-                if isinstance(r, Exception):
-                    results[tid] = f"ERROR in subagent: {r}"
-                    log.event("tool_error", tool="spawn_subagent", error=str(r))
+            results: dict[str, str] = {}
+            spawns = []  # (tool_call_id, coroutine)
+            for tc in tcs:
+                n_tool_calls += 1
+                fn = tc["function"]["name"]
+                fargs, perr = _parse_tool_args(tc)
+                if perr:
+                    results[tc["id"]] = perr[0]
+                    log.event("tool_error", tool=fn, error="bad_json_args", raw_args=perr[1])
+                    continue
+                if fn == "spawn_subagent":
+                    _srole = fargs.get("role", "")
+                    # A PIPELINE ABLATION removes whole stages from the action space. The
+                    # spawn_subagent enum is already narrowed via T.available_roles(), so
+                    # this only catches a model that ignores the schema — refuse rather
+                    # than silently run a role the arm is supposed to have removed.
+                    if _srole not in roles:
+                        results[tc["id"]] = (
+                            f"ERROR: role {_srole!r} is not available in this run. "
+                            f"Available roles: {', '.join(roles)}."
+                        )
+                        log.event("tool_error", tool="spawn_subagent",
+                                  error=f"role_not_available:{_srole}")
+                        continue
+                    n_subagents += 1
+                    log.event("spawn_subagent", role=_srole)
+                    spawns.append((tc["id"], asyncio.to_thread(
+                        _run_subagent, _srole, fargs.get("task", ""),
+                        ctx, model, log, _srole, f"{_srole}#{n_subagents}",
+                        max_sub_turns)))
                 else:
-                    results[tid] = r["digest"]
-                    sub_tokens += r["tokens"]; sub_calls += r["calls"]
-                    sub_parser_retries += r.get("retries_on_parser_error", 0)
+                    try:
+                        results[tc["id"]] = T.run_tool(fn, fargs, ctx, tool_call_id=tc["id"])
+                    except Exception as exc:  # noqa: BLE001
+                        results[tc["id"]] = f"ERROR in {fn}: {exc}"
+                        log.event("tool_error", tool=fn, error=str(exc), tool_call_id=tc["id"])
 
-        for tc in tcs:  # append tool results in original order (matched by id)
-            # ``name`` REQUIRED for text-tools parity — see _tool_loop for rationale.
-            messages.append({"role": "tool", "tool_call_id": tc["id"],
-                             "name": tc["function"]["name"],
-                             "content": results.get(tc["id"], "(no result)")})
-    else:
-        log.event("loop_end", turn=max_turns, reason="max_turns")
+            if spawns:  # run all subagents of this turn concurrently
+                done = await asyncio.gather(*[c for _, c in spawns], return_exceptions=True)
+                for (tid, _), r in zip(spawns, done):
+                    if isinstance(r, Exception):
+                        results[tid] = f"ERROR in subagent: {r}"
+                        log.event("tool_error", tool="spawn_subagent", error=str(r))
+                    else:
+                        results[tid] = r["digest"]
+                        sub_tokens += r["tokens"]; sub_calls += r["calls"]
+                        sub_parser_retries += r.get("retries_on_parser_error", 0)
+
+            for tc in tcs:  # append tool results in original order (matched by id)
+                # ``name`` REQUIRED for text-tools parity — see _tool_loop for rationale.
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "name": tc["function"]["name"],
+                                 "content": results.get(tc["id"], "(no result)")})
+        else:
+            stop_reason = "exploration_budget"
+            log.event("loop_end", turn=exploration_turns, reason=stop_reason)
+    except Exception as exc:
+        loop_error = f"{type(exc).__name__}: {exc}"
+        stop_reason = "orchestrator_error"
+        raise
+    finally:
+        survivors = [cid for cid, value in verdicts(docs_dir).items() if value == "survive"]
+        if not loop_error and proposal(docs_dir) is None and survivors and "report_writer" in roles:
+            n_subagents += 1
+            log.event("forced_finalization", candidate=survivors[-1], max_turns=finalization_turns)
+            try:
+                result = await asyncio.to_thread(
+                    _run_subagent, "report_writer",
+                    f"Write the final report for {survivors[-1]}. Exploration is closed. "
+                    "Read the existing gaps, candidates, scores and paper digests. "
+                    "Preserve all limitations and review objections; do not invent results. "
+                    "Prioritize writing a complete report.json within this finalization budget.",
+                    ctx, model, log, "report_writer", f"report_writer#{n_subagents}",
+                    max_sub_turns, hard_turn_cap=finalization_turns)
+                sub_tokens += result["tokens"]
+                sub_calls += result["calls"]
+                sub_parser_retries += result.get("retries_on_parser_error", 0)
+            except Exception as exc:
+                finalizer_error = f"{type(exc).__name__}: {exc}"
+                log.event("finalization_error", error=finalizer_error)
+        completion = complete(run_dir, stop_reason, loop_error or finalizer_error)
+        log.event("report_delivered", **completion)
+        if loop_error:
+            log_registry.close_all()
+            log.close()
+            client.close()
 
     produced = sorted(p.name for p in docs_dir.glob("*.md")) + \
         sorted(p.name for p in docs_dir.glob("*.json")) + \
@@ -827,6 +869,9 @@ async def run_ideation(
     sub_parser_retries += reader_acc["parser_retries"]
     summary = {
         "run_dir": str(run_dir), "model": model,
+        "completion": completion,
+        "exploration_turn_budget": exploration_turns,
+        "finalization_turn_budget": finalization_turns,
         "orchestrator_tool_calls": n_tool_calls, "subagents_spawned": n_subagents,
         "papers_read": reader_acc["n"],
         "orchestrator_tokens": orch["total_tokens"], "orchestrator_calls": orch["total_calls"],

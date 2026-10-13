@@ -418,4 +418,12 @@ def get_stored_full_text(paper_id: int) -> str:
         row = None
     finally:
         con.close()
-    return row[0] if row and row[0] else ""
+    if row and row[0]:
+        return row[0]
+    # openalice patch: the HF vault release has no full text; give the reader the
+    # paper's whole results-masked record instead of title+abstract only.
+    rec = get_paper_record(int(paper_id))
+    if rec:
+        from ideascientist.vault.fields import serialize_labeled
+        return "\n\n".join(f"## {k.replace('_', ' ').title()}\n{serialize_labeled(v)}" for k, v in rec.items() if v)
+    return ""

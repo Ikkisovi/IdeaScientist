@@ -1,0 +1,2 @@
+{"mode": "chat", "drop": ["chat_template_kwargs"],
+ "upstreams": [{"provider": "antigravity-oci"}, {"provider": "antigravity-phx"}]}
